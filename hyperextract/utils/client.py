@@ -400,6 +400,10 @@ def create_llm(
             # Anthropic requires max_tokens; default low (1024) truncates large
             # structured extractions, so use a more generous default.
             max_tokens=config.get("max_tokens", 4096),
+            # Same reason as the OpenAI path below: no timeout means a dropped connection
+            # hangs the caller indefinitely instead of raising.
+            timeout=config.get("timeout", float(os.environ.get("HYPER_EXTRACT_LLM_TIMEOUT", 300))),
+            max_retries=config.get("max_retries", int(os.environ.get("HYPER_EXTRACT_LLM_RETRIES", 2))),
         )
 
     if provider in GOOGLE_PROVIDERS:
@@ -440,6 +444,14 @@ def create_llm(
         "api_key": config["api_key"] or _env_api_key(provider),
         "base_url": config.get("base_url") or None,
         "temperature": config.get("temperature", 0),
+        # Without a timeout a dropped connection hangs the caller forever rather than
+        # raising: the socket closes, nothing errors, and a long extraction stalls
+        # indefinitely with no log line. Observed in practice on a multi-hour run whose
+        # sockets were all in CLOSED state while the process still waited.
+        # Generous, because a large structured-output request is legitimately slow.
+        "timeout": config.get("timeout", float(os.environ.get("HYPER_EXTRACT_LLM_TIMEOUT", 300))),
+        "max_retries": config.get("max_retries",
+                                  int(os.environ.get("HYPER_EXTRACT_LLM_RETRIES", 2))),
     }
     if extra_body:
         chat_kwargs["extra_body"] = extra_body
