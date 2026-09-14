@@ -58,6 +58,7 @@ GRAPH_PARAMS = (
 
 YAML_TO_AUTOTYPE_MAPPING = {
     "merge_strategy": "strategy_or_merger",
+    "fields_for_search": "fields_for_index",
     "entity_merge_strategy": "node_strategy_or_merger",
     "relation_merge_strategy": "edge_strategy_or_merger",
     "entity_fields_for_search": "node_fields_for_index",
