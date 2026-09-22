@@ -452,6 +452,21 @@ def create_llm(
         "timeout": config.get("timeout", float(os.environ.get("HYPER_EXTRACT_LLM_TIMEOUT", 300))),
         "max_retries": config.get("max_retries",
                                   int(os.environ.get("HYPER_EXTRACT_LLM_RETRIES", 2))),
+        # Set explicitly, and generously. Omitting it does not mean "no limit" -- it means
+        # the provider's default, and behind a proxy that default is invisible from here
+        # and small enough to shape the answer.
+        #
+        # Measured on one 21k-token chunk of a real solicitation, same prompt, same model:
+        # unset returned 75 requirements in 6,968 completion tokens; max_tokens=32000
+        # returned 108 in 11,071. Both reported finish_reason "stop". The model does not
+        # truncate at the ceiling, it writes to fit it -- so the short answer looks
+        # complete and no caller can tell the two apart.
+        #
+        # This is why extraction quality appeared to degrade with larger inputs: the
+        # bigger chunks were not being read worse, they were being answered shorter. The
+        # Anthropic branch above has always set this, for the same reason.
+        "max_tokens": config.get(
+            "max_tokens", int(os.environ.get("HYPER_EXTRACT_MAX_TOKENS", 32768))),
     }
     if extra_body:
         chat_kwargs["extra_body"] = extra_body
