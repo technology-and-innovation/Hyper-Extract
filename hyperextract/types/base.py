@@ -1,5 +1,6 @@
 import json
 from abc import ABC, abstractmethod
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -104,6 +105,8 @@ class BaseAutoType(ABC, Generic[T]):
         # max_tokens, unparseable reply). Its content is NOT in the result, so a caller
         # that must not lose content reads this and re-asks or fails -- see
         # ``take_chunk_failures``. Recording it is what keeps a failure from being silent.
+        # Holds NO document, chunk or prompt text: identity (index, sha256), size and a
+        # content-free error summary only (see ``_safe_error``).
         self.chunk_failures: list[dict] = []
 
     def _create_empty_instance(self) -> "BaseAutoType[T]":
@@ -345,20 +348,54 @@ class BaseAutoType(ABC, Generic[T]):
             return [r for r in results if r is not None]
         return results
 
-    def _record_failure(self, stage: str, index: int, input: dict, error: BaseException) -> None:
-        """Keep a failed chunk -- its input included -- so its loss is visible and it
-        can be asked again. Only the input the caller already holds is kept; nothing is
-        logged beyond the stage, index, size and error."""
+    @staticmethod
+    def _safe_error(error: BaseException) -> str:
+        """The error's class and a summary that carries no document or model text.
+
+        Provider, parser and validation errors routinely embed the prompt, the model's
+        reply or offending input values in their message, so the message itself is never
+        used: only an HTTP status, a timeout, or (for validation errors) the failing
+        field locations and error types -- never their values.
+        """
+        name = type(error).__name__
+        status = getattr(error, "status_code", None) or getattr(
+            getattr(error, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return f"{name}: HTTP {status}"
+        if "timeout" in name.lower() or isinstance(error, TimeoutError):
+            return f"{name}: timed out"
+        errors = getattr(error, "errors", None)
+        if callable(errors):
+            try:
+                items = errors()
+                locs = sorted({".".join(str(x) for x in e.get("loc", ())) + ":" + str(e.get("type"))
+                               for e in items if isinstance(e, dict)})
+                return f"{name}: {len(items)} validation error(s) at {', '.join(locs[:8])}"
+            except Exception:  # noqa: BLE001 -- the summary must never raise
+                pass
+        return name
+
+    def _record_failure(self, stage: str, index: int, input: dict,
+                        error: BaseException) -> dict:
+        """Record a failed chunk so its loss is visible and it can be asked again --
+        by identity only. The caller holds the chunks and maps a failure back to its own
+        by ``index`` or ``sha256``; no chunk text is kept here or logged."""
         text = input.get("source_text") if isinstance(input, dict) else None
-        self.chunk_failures.append({
+        rec = {
             "stage": stage, "index": index,
             "chars": len(text) if isinstance(text, str) else None,
-            "error": f"{type(error).__name__}: {str(error)[:500]}",
-            "input": input,
-        })
+            #: ~4 characters a token: an estimate for sizing, not a count.
+            "est_tokens": (len(text) + 3) // 4 if isinstance(text, str) else None,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if isinstance(text, str) else None,
+            "error": self._safe_error(error),
+        }
+        self.chunk_failures.append(rec)
+        return rec
 
     def take_chunk_failures(self) -> list[dict]:
-        """The failed chunks recorded so far, clearing the record."""
+        """The failures recorded so far -- metadata only (stage, index, chars,
+        est_tokens, sha256, sanitized error); never chunk text -- clearing the record."""
         out, self.chunk_failures = self.chunk_failures, []
         return out
 
@@ -380,8 +417,9 @@ class BaseAutoType(ABC, Generic[T]):
         try:
             return extractor.invoke(input)
         except Exception as e:
-            logger.error("stage=%s_single_extract_failed error=%s", stage, e)
-            self._record_failure(stage, 0, input, e)
+            rec = self._record_failure(stage, 0, input, e)
+            logger.error("stage=%s_single_extract_failed chars=%s sha256=%s error=%s",
+                         stage, rec["chars"], rec["sha256"], rec["error"])
             return None
 
     def _batch_safe(self, extractor, inputs: list[dict], *, stage: str) -> list:
@@ -403,10 +441,11 @@ class BaseAutoType(ABC, Generic[T]):
         results: list = []
         for i, r in enumerate(raw):
             if isinstance(r, Exception):
+                rec = self._record_failure(stage, i, inputs[i], r)
                 logger.error(
-                    "stage=%s_chunk_extract_failed chunk_index=%d error=%s", stage, i, r
+                    "stage=%s_chunk_extract_failed chunk_index=%d chars=%s sha256=%s error=%s",
+                    stage, i, rec["chars"], rec["sha256"], rec["error"],
                 )
-                self._record_failure(stage, i, inputs[i], r)
                 results.append(None)
             else:
                 results.append(r)
