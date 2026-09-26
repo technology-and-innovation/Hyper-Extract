@@ -100,6 +100,11 @@ class BaseAutoType(ABC, Generic[T]):
         # Set by parse()/feed_text() while extraction runs; graph-family
         # subclasses record raw extraction results under it (provenance).
         self._pending_source_id: str | None = None
+        # Every chunk whose model call failed (rate limit, timeout, output cut off at
+        # max_tokens, unparseable reply). Its content is NOT in the result, so a caller
+        # that must not lose content reads this and re-asks or fails -- see
+        # ``take_chunk_failures``. Recording it is what keeps a failure from being silent.
+        self.chunk_failures: list[dict] = []
 
     def _create_empty_instance(self) -> "BaseAutoType[T]":
         """Creates a new empty instance with the same configuration as this one.
@@ -327,8 +332,11 @@ class BaseAutoType(ABC, Generic[T]):
             return results
         none_count = sum(1 for r in results if r is None)
         if none_count > 0:
-            logger.warning(
-                "stage=batch_filter none_results_detected none_count=%d total=%d",
+            # Not a benign filter: these chunks' content is missing from the result.
+            # The failures are in ``chunk_failures`` for the caller to act on.
+            logger.error(
+                "stage=batch_filter none_results_detected none_count=%d total=%d "
+                "(content of these chunks is NOT in the result; see chunk_failures)",
                 none_count,
                 len(results),
             )
@@ -336,6 +344,23 @@ class BaseAutoType(ABC, Generic[T]):
                 return [r if r is not None else default_factory() for r in results]
             return [r for r in results if r is not None]
         return results
+
+    def _record_failure(self, stage: str, index: int, input: dict, error: BaseException) -> None:
+        """Keep a failed chunk -- its input included -- so its loss is visible and it
+        can be asked again. Only the input the caller already holds is kept; nothing is
+        logged beyond the stage, index, size and error."""
+        text = input.get("source_text") if isinstance(input, dict) else None
+        self.chunk_failures.append({
+            "stage": stage, "index": index,
+            "chars": len(text) if isinstance(text, str) else None,
+            "error": f"{type(error).__name__}: {str(error)[:500]}",
+            "input": input,
+        })
+
+    def take_chunk_failures(self) -> list[dict]:
+        """The failed chunks recorded so far, clearing the record."""
+        out, self.chunk_failures = self.chunk_failures, []
+        return out
 
     def _invoke_safe(self, extractor, input: dict, *, stage: str):
         """invoke() with provider failures logged and nulled instead of raised.
@@ -355,7 +380,8 @@ class BaseAutoType(ABC, Generic[T]):
         try:
             return extractor.invoke(input)
         except Exception as e:
-            logger.warning("stage=%s_single_extract_failed error=%s", stage, e)
+            logger.error("stage=%s_single_extract_failed error=%s", stage, e)
+            self._record_failure(stage, 0, input, e)
             return None
 
     def _batch_safe(self, extractor, inputs: list[dict], *, stage: str) -> list:
@@ -377,9 +403,10 @@ class BaseAutoType(ABC, Generic[T]):
         results: list = []
         for i, r in enumerate(raw):
             if isinstance(r, Exception):
-                logger.warning(
+                logger.error(
                     "stage=%s_chunk_extract_failed chunk_index=%d error=%s", stage, i, r
                 )
+                self._record_failure(stage, i, inputs[i], r)
                 results.append(None)
             else:
                 results.append(r)
@@ -443,6 +470,8 @@ class BaseAutoType(ABC, Generic[T]):
 
         new_instance = self._create_empty_instance()
         new_instance._set_data_state(parsed_data)
+        # The chunks that failed belong to what was parsed: they travel with it.
+        new_instance.chunk_failures = self.take_chunk_failures()
         if source_id:
             new_instance._adopt_source_ledger(self, source_id)
 
@@ -811,6 +840,7 @@ class BaseAutoType(ABC, Generic[T]):
 
         # Set the merged data using hook and update metadata
         new_instance._set_data_state(merged_data)
+        new_instance.chunk_failures = [*self.chunk_failures, *other.chunk_failures]
         new_instance.metadata["created_at"] = min(
             self.metadata["created_at"], other.metadata["created_at"]
         )
