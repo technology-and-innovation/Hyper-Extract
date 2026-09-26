@@ -605,7 +605,7 @@ class AutoSet(BaseAutoType[AutoSetSchema[ItemSchema]], Generic[ItemSchema]):
         if removed_keys:
             self._data_memory.sync_index(removed_keys=removed_keys)
             self.metadata["updated_at"] = datetime.now()
-            logger.debug(f"Removed item with key '{key}'")
+            logger.debug("Removed one item by key (key not logged: it is built from extracted values)")
         return item
 
     def contains(self, key: Any) -> bool:

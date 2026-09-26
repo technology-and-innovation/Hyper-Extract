@@ -23,6 +23,11 @@ T = TypeVar("T", bound=BaseModel)
 # ===================== Knowledge Abstract Class =====================
 
 
+
+def _sha(text: str) -> str:
+    """Identity of a chunk for logs: its SHA-256, never its text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 class BaseAutoType(ABC, Generic[T]):
     """Unified knowledge abstract class integrating extraction, storage, and aggregation.
 
@@ -266,7 +271,8 @@ class BaseAutoType(ABC, Generic[T]):
         )
 
         if len(text) <= self.chunk_size:
-            logger.debug("stage=extract_single_chunk chunk_text_preview=%s", text[:200])
+            logger.debug("stage=extract_single_chunk chunk_chars=%d chunk_sha256=%s",
+                         len(text), _sha(text))
             extracted_data = self._invoke_safe(
                 self.data_extractor, {"source_text": text}, stage="extract"
             )
@@ -280,10 +286,10 @@ class BaseAutoType(ABC, Generic[T]):
             logger.debug("stage=text_split num_chunks=%d", len(chunks))
             for i, chunk in enumerate(chunks):
                 logger.debug(
-                    "stage=chunk_before_llm chunk_index=%d chunk_chars=%d chunk_text_preview=%s",
+                    "stage=chunk_before_llm chunk_index=%d chunk_chars=%d chunk_sha256=%s",
                     i,
                     len(chunk),
-                    chunk[:200],
+                    _sha(chunk),
                 )
             inputs = [{"source_text": chunk} for chunk in chunks]
             logger.debug(
@@ -466,7 +472,10 @@ class BaseAutoType(ABC, Generic[T]):
         return
 
     def _summarize_extracted(self, data: T) -> str:
-        """Return a concise summary of extracted data for debug logging."""
+        """A shape-only summary of extracted data for debug logging: counts and which
+        fields are filled -- never a value, since values are document content."""
+        if data is None:
+            return "none"
         try:
             dump = data.model_dump()
             # Count entities and relations for graph-type schemas
@@ -474,16 +483,15 @@ class BaseAutoType(ABC, Generic[T]):
             relations = len(dump.get("relations", []))
             if entities or relations:
                 return f"entities={entities} relations={relations}"
-            # Generic fallback: list top-level keys with their lengths
             parts = []
             for key, val in dump.items():
-                if isinstance(val, (list, tuple)):
+                if isinstance(val, (list, tuple, dict)):
                     parts.append(f"{key}={len(val)}")
-                elif isinstance(val, str):
-                    parts.append(f"{key}={val[:50]!r}")
-            return ", ".join(parts) if parts else str(dump)[:100]
+                else:
+                    parts.append(f"{key}={'set' if val not in (None, '') else 'empty'}")
+            return ", ".join(parts) if parts else "empty"
         except Exception:
-            return repr(data)[:100]
+            return type(data).__name__
 
     def parse(self, text: str, *, source_id: str | None = None) -> "BaseAutoType[T]":
         """
