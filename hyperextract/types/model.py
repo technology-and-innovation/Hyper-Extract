@@ -297,7 +297,7 @@ class AutoModel(BaseAutoType[T]):
                 raw_data = doc.metadata["raw"]  # {field_name: field_value}
                 results.append(raw_data)
             except Exception as e:
-                logger.warning(f"Failed to restore item: {e}")
+                logger.warning("Failed to restore item: %s", type(e).__name__)
 
         logger.info(f"Found {len(results)} results for query: {query[:50]}...")
         return results

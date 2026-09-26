@@ -305,7 +305,7 @@ class AutoList(BaseAutoType[AutoListSchema[ItemSchema]], Generic[ItemSchema]):
                 item = self.item_schema.model_validate(raw)
                 results.append(item)
             except Exception as e:
-                logger.warning(f"Failed to restore item: {e}")
+                logger.warning("Failed to restore item: %s", type(e).__name__)
                 results.append(doc.metadata.get("raw"))
 
         logger.info(f"Found {len(results)} results for query: {query[:50]}...")

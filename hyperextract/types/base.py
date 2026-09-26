@@ -1,3 +1,4 @@
+import hashlib
 import json
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -5,11 +6,12 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from langchain_core.embeddings import Embeddings
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from hyperextract.utils.logging import get_logger
 
@@ -17,6 +19,52 @@ logger = get_logger(__name__)
 
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class EmptyExtractionResult(Exception):
+    """The extractor returned None instead of a result.
+
+    Structured-output runnables return None rather than raising when the model
+    gives no parseable output -- e.g. a reply cut off at the token limit, or text
+    instead of the expected tool call. That chunk's content is missing from the
+    result just as if the call had raised, so it is treated as a chunk failure.
+    (An extraction that genuinely finds nothing returns an empty object, not None.)
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "extractor returned no result (no parseable structured output)"
+        )
+
+
+def _digest(text: str) -> str:
+    """Identify a chunk in logs without logging its text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _log_safe_error(error: BaseException) -> str:
+    """The error as it may appear in a log line.
+
+    Most provider errors (rate limits, timeouts, HTTP failures) are logged as-is:
+    their message is what makes the failure diagnosable and carries no document
+    content. Two kinds quote content in their message and are summarised
+    instead: output-parser errors carry the model's reply, and validation errors
+    echo the offending input values -- for those only the class and the failing
+    field locations are logged. The full message is still kept in
+    ``extraction_failures`` for the caller.
+    """
+    name = type(error).__name__
+    if isinstance(error, OutputParserException):
+        return f"{name} (model output could not be parsed)"
+    if isinstance(error, ValidationError):
+        locs = sorted(
+            {
+                ".".join(str(x) for x in e.get("loc", ())) + f":{e.get('type')}"
+                for e in error.errors()
+            }
+        )
+        return f"{name} ({error.error_count()} validation error(s) at {', '.join(locs[:8])})"
+    return f"{name}: {error}"
 
 
 # ===================== Knowledge Abstract Class =====================
@@ -279,7 +327,11 @@ class BaseAutoType(ABC, Generic[T]):
         )
 
         if len(text) <= self.chunk_size:
-            logger.debug("stage=extract_single_chunk chunk_text_preview=%s", text[:200])
+            logger.debug(
+                "stage=extract_single_chunk chunk_chars=%d chunk_sha256=%s",
+                len(text),
+                _digest(text),
+            )
             extracted_data = self._invoke_safe(
                 self.data_extractor, {"source_text": text}, stage="extract"
             )
@@ -293,10 +345,10 @@ class BaseAutoType(ABC, Generic[T]):
             logger.debug("stage=text_split num_chunks=%d", len(chunks))
             for i, chunk in enumerate(chunks):
                 logger.debug(
-                    "stage=chunk_before_llm chunk_index=%d chunk_chars=%d chunk_text_preview=%s",
+                    "stage=chunk_before_llm chunk_index=%d chunk_chars=%d chunk_sha256=%s",
                     i,
                     len(chunk),
-                    chunk[:200],
+                    _digest(chunk),
                 )
             inputs = [{"source_text": chunk} for chunk in chunks]
             logger.debug(
@@ -363,7 +415,9 @@ class BaseAutoType(ABC, Generic[T]):
 
         One bad chunk (rate limit, timeout, unparseable output) must not abort
         the whole run — failures degrade to None, matching _extract_data's
-        contract. Logs the stage and exception only, never the source text.
+        contract. A None result counts as a failure (``EmptyExtractionResult``).
+        Logs the stage and the error, never the source text; errors whose
+        message quotes content are summarised (see ``_log_safe_error``).
 
         Args:
             extractor: Runnable with an ``invoke`` method.
@@ -371,12 +425,17 @@ class BaseAutoType(ABC, Generic[T]):
             stage: Stage label used in log lines (e.g. ``"one_stage"``).
 
         Returns:
-            The extractor result, or None if it raised.
+            The extractor result, or None if it raised or returned None.
         """
         try:
-            return extractor.invoke(input)
+            result = extractor.invoke(input)
+            if result is None:
+                raise EmptyExtractionResult()
+            return result
         except Exception as e:
-            logger.warning("stage=%s_single_extract_failed error=%s", stage, e)
+            logger.warning(
+                "stage=%s_single_extract_failed error=%s", stage, _log_safe_error(e)
+            )
             self._last_extraction_failures.append(
                 {"chunk_index": 0, "stage": stage, "error": str(e)}
             )
@@ -392,7 +451,9 @@ class BaseAutoType(ABC, Generic[T]):
             stage: Stage label used in log lines (e.g. ``"two_stage_nodes"``).
 
         Returns:
-            List aligned with ``inputs``; failed chunks are None.
+            List aligned with ``inputs``; failed chunks are None. A chunk whose
+            extractor returned None is recorded as a failure too
+            (``EmptyExtractionResult``).
         """
         raw = extractor.batch(
             inputs,
@@ -401,9 +462,14 @@ class BaseAutoType(ABC, Generic[T]):
         )
         results: list = []
         for i, r in enumerate(raw):
+            if r is None:
+                r = EmptyExtractionResult()
             if isinstance(r, Exception):
                 logger.warning(
-                    "stage=%s_chunk_extract_failed chunk_index=%d error=%s", stage, i, r
+                    "stage=%s_chunk_extract_failed chunk_index=%d error=%s",
+                    stage,
+                    i,
+                    _log_safe_error(r),
                 )
                 self._last_extraction_failures.append(
                     {"chunk_index": i, "stage": stage, "error": str(r)}
@@ -430,7 +496,13 @@ class BaseAutoType(ABC, Generic[T]):
         return
 
     def _summarize_extracted(self, data: T) -> str:
-        """Return a concise summary of extracted data for debug logging."""
+        """Return a shape-only summary of extracted data for debug logging.
+
+        Counts and which fields are filled -- never a value, since extracted
+        values are document content.
+        """
+        if data is None:
+            return "none"
         try:
             dump = data.model_dump()
             # Count entities and relations for graph-type schemas
@@ -438,16 +510,16 @@ class BaseAutoType(ABC, Generic[T]):
             relations = len(dump.get("relations", []))
             if entities or relations:
                 return f"entities={entities} relations={relations}"
-            # Generic fallback: list top-level keys with their lengths
+            # Generic fallback: top-level keys with their sizes, never their values
             parts = []
             for key, val in dump.items():
-                if isinstance(val, (list, tuple)):
+                if isinstance(val, (list, tuple, dict)):
                     parts.append(f"{key}={len(val)}")
-                elif isinstance(val, str):
-                    parts.append(f"{key}={val[:50]!r}")
-            return ", ".join(parts) if parts else str(dump)[:100]
+                else:
+                    parts.append(f"{key}={'set' if val not in (None, '') else 'empty'}")
+            return ", ".join(parts) if parts else "empty"
         except Exception:
-            return repr(data)[:100]
+            return type(data).__name__
 
     def parse(self, text: str, *, source_id: str | None = None) -> "BaseAutoType[T]":
         """
