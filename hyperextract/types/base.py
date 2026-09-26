@@ -24,6 +24,13 @@ T = TypeVar("T", bound=BaseModel)
 
 
 
+class EmptyResponse(Exception):
+    """The model call returned no structured output: no reply, a reply cut off at
+    max_tokens before any tool call, or plain text instead of a tool call. Recorded as a
+    chunk failure like a raised error -- a None result is lost content, not "nothing
+    found" (an empty extraction is an object with empty lists, not None)."""
+
+
 def _sha(text: str) -> str:
     """Identity of a chunk for logs: its SHA-256, never its text."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -364,6 +371,9 @@ class BaseAutoType(ABC, Generic[T]):
         field locations and error types -- never their values.
         """
         name = type(error).__name__
+        if isinstance(error, EmptyResponse):
+            return (f"{name}: no structured output (no reply, a reply cut off at "
+                    "max_tokens, or no tool call)")
         status = getattr(error, "status_code", None) or getattr(
             getattr(error, "response", None), "status_code", None)
         if isinstance(status, int):
@@ -418,10 +428,14 @@ class BaseAutoType(ABC, Generic[T]):
             stage: Stage label used in log lines (e.g. ``"one_stage"``).
 
         Returns:
-            The extractor result, or None if it raised.
+            The extractor result, or None if it raised or returned nothing (both
+            recorded in ``chunk_failures``).
         """
         try:
-            return extractor.invoke(input)
+            result = extractor.invoke(input)
+            if result is None:
+                raise EmptyResponse()
+            return result
         except Exception as e:
             rec = self._record_failure(stage, 0, input, e)
             logger.error("stage=%s_single_extract_failed chars=%s sha256=%s error=%s",
@@ -437,7 +451,8 @@ class BaseAutoType(ABC, Generic[T]):
             stage: Stage label used in log lines (e.g. ``"two_stage_nodes"``).
 
         Returns:
-            List aligned with ``inputs``; failed chunks are None.
+            List aligned with ``inputs``; failed chunks -- raised, or returned None --
+            are None, and each is recorded in ``chunk_failures`` by its index.
         """
         raw = extractor.batch(
             inputs,
@@ -446,6 +461,8 @@ class BaseAutoType(ABC, Generic[T]):
         )
         results: list = []
         for i, r in enumerate(raw):
+            if r is None:
+                r = EmptyResponse()
             if isinstance(r, Exception):
                 rec = self._record_failure(stage, i, inputs[i], r)
                 logger.error(
